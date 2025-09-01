@@ -164,17 +164,14 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     log.info(f"Webhook recebido: {payload}")
     info = parse_cartpanda_payload(payload)
 
-    event = (payload.get("event") or info["status"] or "").lower()
 
-    if "paid" in event or info.get("payment_status") in {"paid", "pago"}:
-        cancel_if_paid(info["order_id"])
-        return JSONResponse({"ok": True, "action": "paid_cancelled", "order_id": info["order_id"]})
+event = (payload.get("event") or info["status"] or "").lower()
 
-    if any(k in event for k in ["checkout.abandoned", "order.created", "pending", "pix"]):
-        await schedule_abandoned_followup(info)
-        return JSONResponse({"ok": True, "action": "scheduled_5min", "order_id": info["order_id"]})
 
-    return JSONResponse({"ok": True, "action": "ignored_or_unknown", "event": event, "parsed": info})
+if any(k in event for k in ["checkout.abandoned", "carrinho", "abandonado"]):
+    await send_abandoned_message(info)
+    return JSONResponse({"ok": True, "action": "sent_immediately", "order_id": info.get("order_id")})
+
 
 
 
