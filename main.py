@@ -17,11 +17,6 @@ SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
 MSG_TEMPLATE: str = os.getenv(
     "MSG_TEMPLATE",
-    (
-        "Oi {name}! Sou Iara, consultora de vendas da {brand} e vi que você deixou o produto "
-        "{product} no carrinho por {price}. Finalize aqui: {checkout_url}"
-    ),
-)
 
 ZAPI_URL: str = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
 
