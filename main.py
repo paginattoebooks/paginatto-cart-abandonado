@@ -16,7 +16,7 @@ ZAPI_CLIENT_TOKEN: str = os.getenv("ZAPI_CLIENT_TOKEN", "")
 SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
 MSG_TEMPLATE: str = os.getenv(
-    "MSG_TEMPLATE",
+    "MSG_TEMPLATE",)
 
 ZAPI_URL: str = f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
 
