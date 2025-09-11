@@ -116,7 +116,6 @@ def parse_cartpanda_payload(payload: dict) -> dict:
         return parse_abandoned_payload(payload)
     return parse_order_payload(payload)
 
-
 # ---------------- Webhook ----------------
 @app.post("/webhook/cartpanda")
 async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
@@ -125,7 +124,6 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     info = parse_cartpanda_payload(payload)
     event = (payload.get("event") or info.get("status") or "").lower()
 
-    # Dispara para carrinho abandonado
     if ("abandoned" in event) or ("checkout.abandoned" in event):
         phone_norm = normalize_phone(info.get("phone"))
         log.info(f"[{info.get('order_id')}] phone_raw={info.get('phone')} phone_norm={phone_norm}")
@@ -134,22 +132,27 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
             log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
             return JSONResponse({"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")})
 
-        message = MSG_TEMPLATE.format(
-            name=info.get("name", "cliente"),
-            product=info.get("product", "seu produto"),
-            price=info.get("price", "R$ 0,00"),
-            checkout_url=info.get("checkout_url", "#"),
-            brand=SENDER_NAME,
-        )
+        # calcula primeiro nome a partir de 'name'
+        _name = (info.get("name") or "cliente").strip()
+        first_name = (_name.split() or ["cliente"])[0]
 
+        data = {
+            "name": _name,                                 # continua disponível
+            "first_name": first_name,                      # NOVO -> para seu template
+            "product": info.get("product", "seu produto"),
+            "price": info.get("price", "R$ 0,00"),
+            "checkout_url": info.get("checkout_url", ""),
+            "cart_url": info.get("cart_url", ""),
+            "brand": SENDER_NAME,
+        }
+
+        message = safe_format(MSG_TEMPLATE, data)
         result = await send_whatsapp(phone_norm, message)
         log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
         return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
 
-    # Outros eventos: só loga
     log.info(f"[{info.get('order_id')}] ignorado event={event}")
     return JSONResponse({"ok": True, "action": "ignored", "event": event, "order_id": info.get("order_id")})
-
 
 # ---------------- Health ----------------
 @app.get("/health")
