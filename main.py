@@ -89,6 +89,38 @@ def parse_abandoned_payload(payload: dict) -> dict:
         "price": price or "R$ 0,00",
     }
 
+def render_msg(template: str, ctx: dict) -> str:
+    from collections import defaultdict
+    return template.format_map(defaultdict(str, ctx))
+
+def parse_abandoned_payload(payload: dict) -> dict:
+    data = payload.get("data", {}) or {}
+    cust = data.get("customer") or data.get("customer_info") or {}
+    items = data.get("cart_line_items") or []
+
+    name = cust.get("full_name") or f"{cust.get('first_name','')} {cust.get('last_name','')}".strip() or "cliente"
+    phone = cust.get("phone")
+    product = None
+    price = None
+    if items:
+        first = items[0] or {}
+        variant = first.get("variant") or {}
+        product = (variant.get("product") or {}).get("title") or variant.get("title")
+        price = variant.get("price")
+
+    return {
+        "name": name,
+        "first_name": cust.get("first_name") or (name.split(" ")[0] if name else ""),
+        "product": product or "",
+        "price": price or "",
+        "phone": phone or "",
+        "checkout_url": data.get("checkout_url") or "",
+    }
+
+# uso:
+parsed = parse_abandoned_payload(payload)
+message = render_msg(MSG_TEMPLATE, parsed)
+await zapi_send_text(parsed["phone"], message)
 
 def parse_order_payload(payload: dict) -> dict:
     """Extrai dados quando o formato é de pedido (dados em payload['order'])."""
