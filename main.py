@@ -1,4 +1,4 @@
-# main.py — Carrinho Abandonado → WhatsApp (Z-API)
+# main.py — Carrinho Abandonado → WhatsApp (UAZAPI)
 import os
 import logging
 from typing import Any, Dict, Optional, List
@@ -11,10 +11,21 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("paginatto-abandoned")
 
-# ---------------- Env Vars ----------------
-ZAPI_INSTANCE: str = os.getenv("ZAPI_INSTANCE", "")
-ZAPI_TOKEN: str = os.getenv("ZAPI_TOKEN", "")
-ZAPI_CLIENT_TOKEN: str = os.getenv("ZAPI_CLIENT_TOKEN", "")
+# ---------------- Env Vars (UAZAPI) ----------------
+UAZAPI_SERVER_URL = os.getenv("UAZAPI_SERVER_URL", "https://free.uazapi.com").rstrip("/")
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN", "")
+
+# Endpoint e auth configuráveis (para não depender de “chute”)
+UAZAPI_SEND_PATH = os.getenv("UAZAPI_SEND_PATH", "").strip()  # obrigatório
+UAZAPI_AUTH_HEADER = os.getenv("UAZAPI_AUTH_HEADER", "Authorization")
+UAZAPI_AUTH_PREFIX = os.getenv("UAZAPI_AUTH_PREFIX", "Bearer ")
+UAZAPI_TOKEN_KIND = os.getenv("UAZAPI_TOKEN_KIND", "instance").lower().strip()  # instance|admin
+
+# Campos do payload configuráveis
+UAZAPI_TO_FIELD = os.getenv("UAZAPI_TO_FIELD", "phone")      # ou "to"/"number"
+UAZAPI_TEXT_FIELD = os.getenv("UAZAPI_TEXT_FIELD", "message")  # ou "text"/"body"
+
 SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
 MSG_TEMPLATE: Optional[str] = os.getenv(
@@ -25,11 +36,7 @@ MSG_TEMPLATE: Optional[str] = os.getenv(
     ),
 )
 
-ZAPI_URL: str = (
-    f"https://api.z-api.io/instances/{ZAPI_INSTANCE}/token/{ZAPI_TOKEN}/send-text"
-)
-
-app = FastAPI(title="Paginatto - Carrinho Abandonado", version="1.1.0")
+app = FastAPI(title="Paginatto - Carrinho Abandonado", version="2.0.0")
 
 
 # ---------------- Helpers ----------------
@@ -46,20 +53,46 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
     return None
 
 
-async def zapi_send_text(phone: str, message: str) -> Dict[str, Any]:
-    headers = {"Client-Token": ZAPI_CLIENT_TOKEN, "Content-Type": "application/json"}
-    payload = {"phone": phone, "message": message}
+def _uazapi_token() -> str:
+    return UAZAPI_ADMIN_TOKEN if UAZAPI_TOKEN_KIND == "admin" else UAZAPI_INSTANCE_TOKEN
+
+
+async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
+    """
+    Envio via UAZAPI.
+    Configure no Render:
+      - UAZAPI_SEND_PATH (obrigatório)
+      - UAZAPI_AUTH_HEADER / UAZAPI_AUTH_PREFIX / UAZAPI_TOKEN_KIND
+      - UAZAPI_TO_FIELD / UAZAPI_TEXT_FIELD
+    """
+    if not UAZAPI_SEND_PATH:
+        return {"status": "error", "body": "missing_env:UAZAPI_SEND_PATH"}
+
+    token = _uazapi_token()
+    if not token:
+        return {"status": "error", "body": "missing_env:UAZAPI_INSTANCE_TOKEN/UAZAPI_ADMIN_TOKEN"}
+
+    url = f"{UAZAPI_SERVER_URL}{UAZAPI_SEND_PATH}"
+    headers = {
+        "Content-Type": "application/json",
+        UAZAPI_AUTH_HEADER: f"{UAZAPI_AUTH_PREFIX}{token}".strip(),
+    }
+    payload = {
+        UAZAPI_TO_FIELD: phone,
+        UAZAPI_TEXT_FIELD: message,
+    }
+
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(ZAPI_URL, headers=headers, json=payload)
+        r = await client.post(url, headers=headers, json=payload)
         try:
             body = r.json()
         except Exception:
             body = r.text
-        return {"status": r.status_code, "body": body}
+        return {"status": r.status_code, "body": body, "url": url}
 
 
 class _SafeDict(dict):
-    def __missing__(self, key):  # evita KeyError em templates
+    def __missing__(self, key):
         return ""
 
 
@@ -96,7 +129,6 @@ def resolve_checkout_url(payload: dict, scoped: Optional[dict] = None) -> str:
     for k in keys:
         if s.get(k):
             return s[k]
-    # procurar no payload bruto
     for k in keys:
         if payload.get(k):
             return payload[k]
@@ -108,7 +140,6 @@ def resolve_checkout_url(payload: dict, scoped: Optional[dict] = None) -> str:
 
 
 def _product_from_item(item: dict) -> str:
-    # tenta várias formas comuns
     variant = item.get("variant") or {}
     prod_obj = item.get("product") or variant.get("product") or {}
     title = _coalesce(
@@ -150,7 +181,6 @@ def parse_abandoned_payload(payload: dict) -> dict:
     cust = data.get("customer") or data.get("customer_info") or {}
     items = data.get("cart_line_items") or data.get("line_items") or data.get("items") or []
 
-    # nome
     name = (
         cust.get("full_name")
         or f"{cust.get('first_name','')} {cust.get('last_name','')}".strip()
@@ -158,7 +188,6 @@ def parse_abandoned_payload(payload: dict) -> dict:
     )
     first_name = cust.get("first_name") or (name.split()[0] if name else "cliente")
 
-    # item + preço
     first = (items[0] or {}) if items else {}
     product = _product_from_item(first)
     price = _price_from_item_or_totals(
@@ -231,7 +260,6 @@ def parse_cartpanda_payload(payload: dict) -> dict:
         return parse_abandoned_payload(payload)
     if "order" in payload:
         return parse_order_payload(payload)
-    # fallback: tenta como pedido
     return parse_order_payload(payload)
 
 
@@ -264,15 +292,16 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     }
     message = safe_format(MSG_TEMPLATE, data)
 
-    result = await zapi_send_text(phone_norm, message)
+    result = await uazapi_send_text(phone_norm, message)
     log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
-    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id")})
+    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id"), "provider": "uazapi", "result": result})
 
 
 # ---------------- Health/Root ----------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "paginatto-abandoned"}
+    return {"ok": True, "service": "paginatto-abandoned", "provider": "uazapi"}
+
 
 @app.get("/health")
 def health():
@@ -282,6 +311,4 @@ def health():
 # Execução local (opcional)
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
