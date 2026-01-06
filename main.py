@@ -1,7 +1,7 @@
-# main.py — Carrinho Abandonado → WhatsApp (UAZAPI)
+# main.py — Carrinho Abandonado → WhatsApp (UAZAPI - auto-detect endpoints)
 import os
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 from fastapi import FastAPI, Body
 from fastapi.responses import JSONResponse
@@ -12,19 +12,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("paginatto-abandoned")
 
 # ---------------- Env Vars (UAZAPI) ----------------
-UAZAPI_SERVER_URL = os.getenv("UAZAPI_SERVER_URL", "https://free.uazapi.com").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
-UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN", "")
-
-# Endpoint e auth configuráveis (para não depender de “chute”)
-UAZAPI_SEND_PATH = os.getenv("UAZAPI_SEND_PATH", "").strip()  # obrigatório
-UAZAPI_AUTH_HEADER = os.getenv("UAZAPI_AUTH_HEADER", "Authorization")
-UAZAPI_AUTH_PREFIX = os.getenv("UAZAPI_AUTH_PREFIX", "Bearer ")
-UAZAPI_TOKEN_KIND = os.getenv("UAZAPI_TOKEN_KIND", "instance").lower().strip()  # instance|admin
-
-# Campos do payload configuráveis
-UAZAPI_TO_FIELD = os.getenv("UAZAPI_TO_FIELD", "phone")      # ou "to"/"number"
-UAZAPI_TEXT_FIELD = os.getenv("UAZAPI_TEXT_FIELD", "message")  # ou "text"/"body"
+# Coloque no Render:
+# UAZAPI_BASE_URL = https://free.uazapi.com  (ou https://api.uazapi.com)
+# UAZAPI_TOKEN    = seu token (admin ou instance, o que a plataforma te der para API)
+UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "https://free.uazapi.com").rstrip("/")
+UAZAPI_TOKEN = os.getenv("UAZAPI_TOKEN", "").strip()
 
 SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
 
@@ -36,7 +28,7 @@ MSG_TEMPLATE: Optional[str] = os.getenv(
     ),
 )
 
-app = FastAPI(title="Paginatto - Carrinho Abandonado", version="2.0.0")
+app = FastAPI(title="Paginatto - Carrinho Abandonado", version="3.0.0")
 
 
 # ---------------- Helpers ----------------
@@ -51,44 +43,6 @@ def normalize_phone(raw: Optional[str]) -> Optional[str]:
     if len(digits) >= 10:
         return "55" + digits
     return None
-
-
-def _uazapi_token() -> str:
-    return UAZAPI_ADMIN_TOKEN if UAZAPI_TOKEN_KIND == "admin" else UAZAPI_INSTANCE_TOKEN
-
-
-async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
-    """
-    Envio via UAZAPI.
-    Configure no Render:
-      - UAZAPI_SEND_PATH (obrigatório)
-      - UAZAPI_AUTH_HEADER / UAZAPI_AUTH_PREFIX / UAZAPI_TOKEN_KIND
-      - UAZAPI_TO_FIELD / UAZAPI_TEXT_FIELD
-    """
-    if not UAZAPI_SEND_PATH:
-        return {"status": "error", "body": "missing_env:UAZAPI_SEND_PATH"}
-
-    token = _uazapi_token()
-    if not token:
-        return {"status": "error", "body": "missing_env:UAZAPI_INSTANCE_TOKEN/UAZAPI_ADMIN_TOKEN"}
-
-    url = f"{UAZAPI_SERVER_URL}{UAZAPI_SEND_PATH}"
-    headers = {
-        "Content-Type": "application/json",
-        UAZAPI_AUTH_HEADER: f"{UAZAPI_AUTH_PREFIX}{token}".strip(),
-    }
-    payload = {
-        UAZAPI_TO_FIELD: phone,
-        UAZAPI_TEXT_FIELD: message,
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        try:
-            body = r.json()
-        except Exception:
-            body = r.text
-        return {"status": r.status_code, "body": body, "url": url}
 
 
 class _SafeDict(dict):
@@ -173,6 +127,75 @@ def _price_from_item_or_totals(item: dict, totals: List[Any]) -> str:
     if raw in (None, "", 0):
         raw = _coalesce(totals)
     return currency_brl(raw)
+
+
+# ---------------- UAZAPI sender (auto-detect) ----------------
+def _candidate_requests(phone: str, message: str) -> List[Tuple[str, Dict[str, str], Dict[str, Any]]]:
+    """
+    Gera tentativas (path, headers, payload) para rotas/formatos comuns.
+    A ideia é NÃO depender de UAZAPI_SEND_PATH e NÃO ficar chutando no Render.
+    """
+    token = UAZAPI_TOKEN
+    auth_headers = [
+        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        {"Authorization": token, "Content-Type": "application/json"},
+        {"token": token, "Content-Type": "application/json"},
+        {"Token": token, "Content-Type": "application/json"},
+    ]
+
+    payloads = [
+        {"number": phone, "text": message},
+        {"phone": phone, "message": message},
+        {"to": phone, "text": message},
+        {"to": phone, "message": message},
+    ]
+
+    # rotas comuns vistas em provedores desse tipo
+    paths = [
+        "/message/sendText",
+        "/message/send",
+        "/sendText",
+        "/send/text",
+        "/api/message/sendText",
+        "/api/message/send",
+    ]
+
+    attempts: List[Tuple[str, Dict[str, str], Dict[str, Any]]] = []
+    for p in paths:
+        for h in auth_headers:
+            for body in payloads:
+                attempts.append((p, h, body))
+    return attempts
+
+
+async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
+    if not UAZAPI_TOKEN:
+        return {"status": "error", "body": "missing_env:UAZAPI_TOKEN"}
+
+    base = UAZAPI_BASE_URL.rstrip("/")
+    attempts = _candidate_requests(phone, message)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        last = None
+        for path, headers, payload in attempts:
+            url = f"{base}{path}"
+            try:
+                r = await client.post(url, headers=headers, json=payload)
+                text = r.text
+
+                # 404/405 = rota/método errado -> continua tentando
+                if r.status_code in (404, 405):
+                    last = {"status": r.status_code, "body": text, "url": url}
+                    continue
+
+                # Se não for 404/405, já é resposta útil (200/400/401/403 etc)
+                # Loga e devolve para diagnóstico certeiro.
+                return {"status": r.status_code, "body": text, "url": url, "payload": payload, "headers_used": list(headers.keys())}
+
+            except Exception as e:
+                last = {"status": "error", "body": str(e), "url": url}
+
+        return last or {"status": "error", "body": "no_attempts"}
 
 
 # ---------------- Parsers ----------------
@@ -294,7 +317,14 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
 
     result = await uazapi_send_text(phone_norm, message)
     log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
-    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id"), "provider": "uazapi", "result": result})
+
+    return JSONResponse({
+        "ok": True,
+        "action": "whatsapp_attempted",
+        "order_id": info.get("order_id"),
+        "provider": "uazapi",
+        "result": result,
+    })
 
 
 # ---------------- Health/Root ----------------
@@ -302,13 +332,12 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
 def root():
     return {"ok": True, "service": "paginatto-abandoned", "provider": "uazapi"}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# Execução local (opcional)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
