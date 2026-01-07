@@ -1,23 +1,20 @@
-# main.py — Carrinho Abandonado → WhatsApp (UAZAPI) — SEM PATH HARDCODED
 import os
 import logging
 from typing import Any, Dict, Optional, List
 
-from fastapi import FastAPI, Body
-from fastapi.responses import JSONResponse
 import httpx
+from fastapi import FastAPI, Body
+from fastapi.responses import JSONResponse, Response
 
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("paginatto-abandoned")
 
-# ---------------- Env Vars ----------------
-# Coloque A URL COMPLETA do endpoint de envio aqui (o código NÃO adiciona nada)
-UAZAPI_SEND_URL = os.getenv("UAZAPI_SEND_URL", "").strip()
+# ---------------- ENV (mínimo e sem gambiarra) ----------------
+UAZAPI_SEND_URL: str = os.getenv("UAZAPI_SEND_URL", "").strip()  # URL FINAL (com rota)
+UAZAPI_INSTANCE_TOKEN: str = os.getenv("UAZAPI_INSTANCE_TOKEN", "").strip()
 
-# Token da instância (header "token")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "").strip()
-
-SENDER_NAME = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto").strip()
+SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto").strip()
 
 MSG_TEMPLATE: str = os.getenv(
     "MSG_TEMPLATE",
@@ -27,14 +24,10 @@ MSG_TEMPLATE: str = os.getenv(
     ),
 )
 
-# opcionais
-UAZAPI_LINK_PREVIEW = os.getenv("UAZAPI_LINK_PREVIEW", "false").lower() == "true"
-UAZAPI_READCHAT = os.getenv("UAZAPI_READCHAT", "true").lower() == "true"
-UAZAPI_DELAY = int(os.getenv("UAZAPI_DELAY", "0") or "0")
-
 app = FastAPI(title="Paginatto - Carrinho Abandonado", version="3.0.0")
 
 
+# ---------------- Helpers ----------------
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
     if not raw:
         return None
@@ -88,7 +81,7 @@ def resolve_checkout_url(payload: dict, scoped: Optional[dict] = None) -> str:
     for k in keys:
         if payload.get(k):
             return payload[k]
-    if payload.get("data"):
+    if payload.get("data") and isinstance(payload["data"], dict):
         for k in keys:
             if payload["data"].get(k):
                 return payload["data"][k]
@@ -131,6 +124,7 @@ def _price_from_item_or_totals(item: dict, totals: List[Any]) -> str:
     return currency_brl(raw)
 
 
+# ---------------- Parsers ----------------
 def parse_abandoned_payload(payload: dict) -> dict:
     data = payload.get("data", {}) or {}
     cust = data.get("customer") or data.get("customer_info") or {}
@@ -182,7 +176,12 @@ def parse_order_payload(payload: dict) -> dict:
     product = _product_from_item(first)
     price = _price_from_item_or_totals(
         first,
-        [order.get("total_line_items_price"), order.get("subtotal_price"), order.get("total_price")],
+        [
+            order.get("total_line_items_price"),
+            order.get("subtotal_price"),
+            order.get("total_price"),
+            order.get("unformatted_total_price"),
+        ],
     )
 
     checkout_url = resolve_checkout_url(payload, order)
@@ -202,44 +201,42 @@ def parse_order_payload(payload: dict) -> dict:
 
 def parse_cartpanda_payload(payload: dict) -> dict:
     event = (payload.get("event") or "").lower()
-    if "abandoned" in event or ("data" in payload and payload["data"]):
+    if "abandoned" in event or ("data" in payload and payload.get("data")):
         return parse_abandoned_payload(payload)
     if "order" in payload:
         return parse_order_payload(payload)
     return parse_order_payload(payload)
 
 
+# ---------------- UAZAPI send (SEM PATH FIXO) ----------------
 async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
-    # Sem URL completa = sem envio
     if not UAZAPI_SEND_URL:
         return {"ok": False, "status": "error", "error": "missing_env:UAZAPI_SEND_URL"}
-
     if not UAZAPI_INSTANCE_TOKEN:
         return {"ok": False, "status": "error", "error": "missing_env:UAZAPI_INSTANCE_TOKEN"}
 
     headers = {
         "Content-Type": "application/json",
-        "token": UAZAPI_INSTANCE_TOKEN,  # header API key
+        # Ajuste se a doc pedir outro header (ex: Authorization Bearer ...)
+        "token": UAZAPI_INSTANCE_TOKEN,
     }
 
-    payload = {
-        "number": phone,
-        "text": message,
-        "linkPreview": UAZAPI_LINK_PREVIEW,
-        "readchat": UAZAPI_READCHAT,
-        "delay": UAZAPI_DELAY,
-    }
+    # Ajuste se a doc exigir campos diferentes
+    payload = {"number": phone, "text": message}
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(UAZAPI_SEND_URL, headers=headers, json=payload)
-        try:
-            body = r.json()
-        except Exception:
-            body = r.text
-
-    return {"ok": r.status_code < 400, "status": r.status_code, "body": body}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(UAZAPI_SEND_URL, headers=headers, json=payload)
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            return {"ok": r.status_code < 300, "status": r.status_code, "body": body, "url": UAZAPI_SEND_URL}
+    except Exception as e:
+        return {"ok": False, "status": "error", "error": str(e), "url": UAZAPI_SEND_URL}
 
 
+# ---------------- Webhook ----------------
 @app.post("/webhook/cartpanda")
 async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     log.info("Webhook recebido")
@@ -254,6 +251,7 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     log.info(f"[{info.get('order_id')}] phone_raw={info.get('phone')} phone_norm={phone_norm}")
 
     if not phone_norm:
+        log.warning(f"[{info.get('order_id')}] telefone inválido -> não enviou")
         return JSONResponse({"ok": False, "error": "telefone inválido", "order_id": info.get("order_id")})
 
     data = {
@@ -269,9 +267,11 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
 
     result = await uazapi_send_text(phone_norm, message)
     log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
-    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id"), "result": result})
+
+    return JSONResponse({"ok": True, "action": "whatsapp_attempted", "order_id": info.get("order_id"), "result": result})
 
 
+# ---------------- Health/Root ----------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "paginatto-abandoned", "provider": "uazapi"}
@@ -279,4 +279,10 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/favicon.ico")
+@app.get("/favicon.png")
+def favicon():
+    return Response(status_code=204)
+
 
