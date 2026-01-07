@@ -26,8 +26,7 @@ MSG_TEMPLATE: str = os.getenv(
     ),
 )
 
-# O UAZAPI GO v2 usa POST /send/text (fixo pela doc)
-UAZAPI_SEND_TEXT_ENDPOINT = "/send/text"
+
 
 # Ajustes opcionais do envio
 UAZAPI_LINK_PREVIEW = os.getenv("UAZAPI_LINK_PREVIEW", "false").lower() == "true"
@@ -140,7 +139,7 @@ def _price_from_item_or_totals(item: dict, totals: List[Any]) -> str:
 async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
     """
     UAZAPI GO v2:
-      POST {SERVER_URL}/send/text
+      POST {SERVER_URL}
       Header: token: <INSTANCE_TOKEN>
       Body: { number, text, linkPreview, readchat, delay }
     """
@@ -150,7 +149,7 @@ async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
     if not UAZAPI_INSTANCE_TOKEN:
         return {"ok": False, "status": "error", "error": "missing_env:UAZAPI_INSTANCE_TOKEN"}
 
-    url = f"{UAZAPI_SERVER_URL}{UAZAPI_SEND_TEXT_ENDPOINT}"
+    url = f"{UAZAPI_SERVER_URL}"
     headers = {
         "Content-Type": "application/json",
         "token": UAZAPI_INSTANCE_TOKEN,  # <- IMPORTANTE: é 'token' (api key), não Authorization
