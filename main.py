@@ -1,4 +1,4 @@
-# main.py — Carrinho Abandonado → WhatsApp (UAZAPI) — SEM /send/text
+# main.py — Carrinho Abandonado → WhatsApp (UAZAPI GO v2)
 import os
 import logging
 from typing import Any, Dict, Optional, List
@@ -12,11 +12,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("paginatto-abandoned")
 
 # ---------------- Env Vars (UAZAPI) ----------------
-# IMPORTANTÍSSIMO: aqui é SÓ o domínio/base. Nada de /send/text, /sendText, /message...
-UAZAPI_SERVER_URL = os.getenv("UAZAPI_SERVER_URL", "https://paginatto.uazapi.com").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+# Exemplo: https://paginatto.uazapi.com  (sem barra no final)
+UAZAPI_SERVER_URL = os.getenv("UAZAPI_SERVER_URL", "").rstrip("/")
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "").strip()
 
-WHATSAPP_SENDER_NAME: str = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto")
+SENDER_NAME = os.getenv("WHATSAPP_SENDER_NAME", "Paginatto").strip()
 
 MSG_TEMPLATE: str = os.getenv(
     "MSG_TEMPLATE",
@@ -26,20 +26,28 @@ MSG_TEMPLATE: str = os.getenv(
     ),
 )
 
-app = FastAPI(title="Paginatto - Carrinho Abandonado", version="3.0.0")
+# O UAZAPI GO v2 usa POST /send/text (fixo pela doc)
+UAZAPI_SEND_TEXT_ENDPOINT = "/send/text"
+
+# Ajustes opcionais do envio
+UAZAPI_LINK_PREVIEW = os.getenv("UAZAPI_LINK_PREVIEW", "false").lower() == "true"
+UAZAPI_READCHAT = os.getenv("UAZAPI_READCHAT", "true").lower() == "true"
+UAZAPI_DELAY = int(os.getenv("UAZAPI_DELAY", "0") or "0")
+
+app = FastAPI(title="Paginatto - Carrinho Abandonado", version="2.1.0")
 
 
 # ---------------- Helpers ----------------
 def normalize_phone(raw: Optional[str]) -> Optional[str]:
-    """Normaliza telefone para padrão 55DDDNÚMERO (somente dígitos)."""
     if not raw:
         return None
     digits = "".join(ch for ch in str(raw) if ch.isdigit())
     if not digits:
         return None
-    if digits.startswith("55"):
+    # aceita com DDI
+    if digits.startswith("55") and len(digits) >= 12:
         return digits
-    # se veio sem 55, prefixa
+    # se veio sem DDI mas parece BR (DDD+9 dígitos ou fixo)
     if len(digits) >= 10:
         return "55" + digits
     return None
@@ -128,43 +136,41 @@ def _price_from_item_or_totals(item: dict, totals: List[Any]) -> str:
     return currency_brl(raw)
 
 
-# ---------------- UAZAPI Sender (SEM PATH) ----------------
+# ---------------- UAZAPI Send ----------------
 async def uazapi_send_text(phone: str, message: str) -> Dict[str, Any]:
     """
-    Envio via UAZAPI no servidor pago.
-    REGRA: NÃO usar /send/text nem /sendText nem /message/sendText.
-    Faz POST direto na base do servidor (UAZAPI_SERVER_URL) com action no body.
+    UAZAPI GO v2:
+      POST {SERVER_URL}/send/text
+      Header: token: <INSTANCE_TOKEN>
+      Body: { number, text, linkPreview, readchat, delay }
     """
     if not UAZAPI_SERVER_URL:
-        return {"ok": False, "error": "missing_env:UAZAPI_SERVER_URL"}
-    if not UAZAPI_INSTANCE_TOKEN:
-        return {"ok": False, "error": "missing_env:UAZAPI_INSTANCE_TOKEN"}
+        return {"ok": False, "status": "error", "error": "missing_env:UAZAPI_SERVER_URL"}
 
-    url = UAZAPI_SERVER_URL  # <- SEM /send/text
+    if not UAZAPI_INSTANCE_TOKEN:
+        return {"ok": False, "status": "error", "error": "missing_env:UAZAPI_INSTANCE_TOKEN"}
+
+    url = f"{UAZAPI_SERVER_URL}{UAZAPI_SEND_TEXT_ENDPOINT}"
     headers = {
         "Content-Type": "application/json",
-        "token": UAZAPI_INSTANCE_TOKEN,  # padrão uazapiGO
+        "token": UAZAPI_INSTANCE_TOKEN,  # <- IMPORTANTE: é 'token' (api key), não Authorization
     }
     payload = {
-        "action": "sendMessage",
-        "data": {
-            "number": phone,
-            "text": message,
-        },
+        "number": phone,
+        "text": message,
+        "linkPreview": UAZAPI_LINK_PREVIEW,
+        "readchat": UAZAPI_READCHAT,
+        "delay": UAZAPI_DELAY,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
 
-            return {"status": r.status_code, "body": body, "url": url}
-    except Exception as e:
-        log.exception(f"Erro ao enviar WhatsApp: {e}")
-        return {"status": "error", "body": str(e), "url": url}
+    return {"ok": r.status_code < 400, "status": r.status_code, "body": body, "url": url}
 
 
 # ---------------- Parsers ----------------
@@ -173,7 +179,6 @@ def parse_abandoned_payload(payload: dict) -> dict:
     cust = data.get("customer") or data.get("customer_info") or {}
     items = data.get("cart_line_items") or data.get("line_items") or data.get("items") or []
 
-    # nome
     name = (
         cust.get("full_name")
         or f"{cust.get('first_name','')} {cust.get('last_name','')}".strip()
@@ -181,16 +186,11 @@ def parse_abandoned_payload(payload: dict) -> dict:
     )
     first_name = cust.get("first_name") or (name.split()[0] if name else "cliente")
 
-    # item + preço
     first = (items[0] or {}) if items else {}
     product = _product_from_item(first)
     price = _price_from_item_or_totals(
         first,
-        [
-            data.get("total_line_items_price"),
-            data.get("subtotal_price"),
-            data.get("total_price"),
-        ],
+        [data.get("total_line_items_price"), data.get("subtotal_price"), data.get("total_price")],
     )
 
     checkout_url = resolve_checkout_url(payload, data)
@@ -225,12 +225,7 @@ def parse_order_payload(payload: dict) -> dict:
     product = _product_from_item(first)
     price = _price_from_item_or_totals(
         first,
-        [
-            order.get("total_line_items_price"),
-            order.get("subtotal_price"),
-            order.get("total_price"),
-            order.get("unformatted_total_price"),
-        ],
+        [order.get("total_line_items_price"), order.get("subtotal_price"), order.get("total_price")],
     )
 
     checkout_url = resolve_checkout_url(payload, order)
@@ -250,7 +245,7 @@ def parse_order_payload(payload: dict) -> dict:
 
 def parse_cartpanda_payload(payload: dict) -> dict:
     event = (payload.get("event") or "").lower()
-    if "abandoned" in event or ("data" in payload and payload.get("data")):
+    if "abandoned" in event or ("data" in payload and payload["data"]):
         return parse_abandoned_payload(payload)
     if "order" in payload:
         return parse_order_payload(payload)
@@ -264,12 +259,9 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
     info = parse_cartpanda_payload(payload)
     event = (payload.get("event") or info.get("event") or "").lower()
 
-    # só dispara para abandono
     if "abandoned" not in event and "checkout.abandoned" not in event:
         log.info(f"[{info.get('order_id')}] ignorado event={event}")
-        return JSONResponse(
-            {"ok": True, "action": "ignored", "event": event, "order_id": info.get("order_id")}
-        )
+        return JSONResponse({"ok": True, "action": "ignored", "event": event, "order_id": info.get("order_id")})
 
     phone_norm = normalize_phone(info.get("phone"))
     log.info(f"[{info.get('order_id')}] phone_raw={info.get('phone')} phone_norm={phone_norm}")
@@ -285,22 +277,13 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
         "price": info.get("price", "R$ 0,00"),
         "checkout_url": info.get("checkout_url", ""),
         "cart_url": info.get("cart_url", ""),
-        "brand": WHATSAPP_SENDER_NAME,
+        "brand": SENDER_NAME,
     }
     message = safe_format(MSG_TEMPLATE, data)
 
     result = await uazapi_send_text(phone_norm, message)
     log.info(f"[{info.get('order_id')}] WhatsApp -> {result}")
-
-    return JSONResponse(
-        {
-            "ok": True,
-            "action": "whatsapp_sent",
-            "order_id": info.get("order_id"),
-            "provider": "uazapi",
-            "result": result,
-        }
-    )
+    return JSONResponse({"ok": True, "action": "whatsapp_sent", "order_id": info.get("order_id"), "result": result})
 
 
 # ---------------- Health/Root ----------------
@@ -308,17 +291,11 @@ async def cartpanda_webhook(payload: Dict[str, Any] = Body(...)):
 def root():
     return {"ok": True, "service": "paginatto-abandoned", "provider": "uazapi"}
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# Execução local (opcional)
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
-
-
